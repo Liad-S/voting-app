@@ -237,6 +237,15 @@ resource "aws_lb_target_group" "result" {
     path    = "/healthz"
     matcher = "200"
   }
+
+  # The result page uses socket.io long-polling: every request of a browser must reach the
+  # SAME task, or the session id is unknown to the other task (HTTP 400) and the page stays empty.
+  # This only shows with more than one task (prod runs 2, dev runs 1).
+  stickiness {
+    type            = "lb_cookie"
+    cookie_duration = 86400
+    enabled         = true
+  }
 }
 
 resource "aws_lb_listener" "vote" {
