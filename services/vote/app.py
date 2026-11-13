@@ -6,9 +6,6 @@ import random
 import json
 import logging
 
-# F4 (deliberate, to test the rollback): the container crashes at startup
-raise RuntimeError("F4: deliberate crash at startup")
-
 option_a = os.getenv('OPTION_A', "ביבי")
 option_b = os.getenv('OPTION_B', "אייזנקוט")
 hostname = socket.gethostname()
