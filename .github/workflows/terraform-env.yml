@@ -1,0 +1,146 @@
+# Reusable workflow: plan OR deploy one environment (dev or prod).
+# deploy.yml calls it twice, so the dev and prod logic is written only once.
+name: terraform-env
+
+on:
+  workflow_call:
+    inputs:
+      env:
+        description: "Environment: dev or prod"
+        type: string
+        required: true
+      image_tag:
+        description: "Image tag in ECR (the git commit SHA)"
+        type: string
+        required: true
+      apply:
+        description: "false = plan only (Pull Request), true = apply (push to main)"
+        type: boolean
+        required: true
+
+env:
+  AWS_REGION: eu-north-1
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_name_prefix: ${{ vars.NAME_PREFIX }}
+  TF_VAR_image_tag: ${{ inputs.image_tag }}
+
+jobs:
+  # ---------- Pull Request: plan only, never apply (P5) ----------
+  plan:
+    if: ${{ !inputs.apply }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.5"
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init (${{ inputs.env }} state)
+        working-directory: infra
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=voting-app/${{ inputs.env }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="use_lockfile=true"
+
+      # -lock=false: a plan only reads, so it must never block (or be blocked by) an apply
+      - name: terraform plan
+        working-directory: infra
+        run: |
+          set -o pipefail
+          terraform plan -input=false -no-color -lock=false \
+            -var-file=envs/${{ inputs.env }}.tfvars | tee plan.txt
+
+      - name: Show the plan in the job summary
+        if: always()
+        working-directory: infra
+        run: |
+          {
+            echo "### terraform plan: ${{ inputs.env }}"
+            echo '```'
+            tail -c 60000 plan.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------- Push to main: apply, smoke test, version check ----------
+  deploy:
+    if: ${{ inputs.apply }}
+    runs-on: ubuntu-latest
+    # For prod this is where the run waits for the human approval (P7)
+    environment: ${{ inputs.env }}
+    # Two runs never apply to the same environment at the same time, and a running apply is never cancelled (P11)
+    concurrency:
+      group: terraform-${{ inputs.env }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.5"
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: terraform init (${{ inputs.env }} state)
+        working-directory: infra
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=voting-app/${{ inputs.env }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="use_lockfile=true"
+
+      # Waits until the new version is up, or ECS rolled it back (wait_for_steady_state)
+      - name: terraform apply
+        working-directory: infra
+        run: |
+          terraform apply -input=false -auto-approve \
+            -var-file=envs/${{ inputs.env }}.tfvars
+
+      # P9: both /healthz must answer 200
+      - name: Smoke test
+        working-directory: infra
+        run: |
+          VOTE_URL=$(terraform output -raw vote_url)
+          RESULT_URL=$(terraform output -raw result_url)
+          for url in "$VOTE_URL" "$RESULT_URL"; do
+            ok=0
+            for i in $(seq 1 12); do
+              code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$url/healthz" || true)
+              echo "$url/healthz -> $code"
+              if [ "$code" = "200" ]; then ok=1; break; fi
+              sleep 10
+            done
+            if [ "$ok" != "1" ]; then
+              echo "::error::smoke test failed: $url/healthz did not return 200"
+              exit 1
+            fi
+          done
+
+      # P10: the same plan must now show NO changes.
+      # If ECS rolled the deployment back, the task definition in the state is not what runs, and the plan shows a difference (exit code 2).
+      - name: Version check (plan must be empty)
+        working-directory: infra
+        run: |
+          set +e
+          terraform plan -input=false -detailed-exitcode -lock=false \
+            -var-file=envs/${{ inputs.env }}.tfvars
+          code=$?
+          set -e
+          if [ "$code" -eq 2 ]; then
+            echo "::error::The plan is not empty after the deploy. ECS probably rolled the new version back."
+            exit 1
+          fi
+          exit "$code"
