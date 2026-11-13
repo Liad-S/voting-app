@@ -1,0 +1,10 @@
+.terraform/
+*.tfstate*
+*.zip
+__pycache__/
+node_modules/
+bin/
+obj/
+.env
+tfplan
+.DS_Store
