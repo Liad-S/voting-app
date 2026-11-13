@@ -1,4 +1,9 @@
-# The pipeline (contracts P1-P11). Fill it in. Until it has on: and jobs:, GitHub shows it as an invalid workflow
+# The pipeline (contracts P1-P11).
+#
+#  Pull Request:  checks -> build (no push) + plan dev + plan prod        (never applies)
+#  push to main:  checks -> build (push) -> deploy dev -> [approval] -> deploy prod
+#
+# The environment work (init / plan / apply / smoke test / version check) is in terraform-env.yml.
 name: deploy
 
 on:
@@ -14,7 +19,11 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_REGION: eu-north-1
+
 jobs:
+  # ---------- P3 ----------
   checks:
     runs-on: ubuntu-latest
     steps:
@@ -34,3 +43,92 @@ jobs:
         run: |
           terraform init -backend=false
           terraform validate
+
+  # ---------- P4: one image per service, tagged with the commit SHA ----------
+  build:
+    needs: checks
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [vote, result, worker]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Only a push to main talks to ECR. A Pull Request builds the image and throws it away.
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: github.event_name == 'push'
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        if: github.event_name == 'push'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Re-running a green pipeline must not fail: ECR tags are immutable, so skip when the tag exists
+      - name: Does the image tag already exist?
+        id: exists
+        if: github.event_name == 'push'
+        run: |
+          if aws ecr describe-images \
+              --repository-name "${{ vars.NAME_PREFIX }}-${{ matrix.service }}" \
+              --image-ids imageTag="${{ github.sha }}" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Image ${{ matrix.service }}:${{ github.sha }} already in ECR, skipping the build"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build (and push on main)
+        if: steps.exists.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: services/${{ matrix.service }}
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'push' }}
+          provenance: false
+          tags: ${{ steps.ecr.outputs.registry || 'local' }}/${{ vars.NAME_PREFIX }}-${{ matrix.service }}:${{ github.sha }}
+
+  # ---------- P5: Pull Request, plan dev AND prod, never apply ----------
+  plan-dev:
+    if: github.event_name == 'pull_request'
+    needs: checks
+    uses: ./.github/workflows/terraform-env.yml
+    with:
+      env: dev
+      image_tag: ${{ github.sha }}
+      apply: false
+
+  plan-prod:
+    if: github.event_name == 'pull_request'
+    needs: checks
+    uses: ./.github/workflows/terraform-env.yml
+    with:
+      env: prod
+      image_tag: ${{ github.sha }}
+      apply: false
+
+  # ---------- P6: push to main, deploy dev ----------
+  deploy-dev:
+    if: github.event_name == 'push'
+    needs: build
+    uses: ./.github/workflows/terraform-env.yml
+    with:
+      env: dev
+      image_tag: ${{ github.sha }}
+      apply: true
+
+  # ---------- P7 + P8: prod after dev succeeded, waits for the approval (Environment "prod"),
+  # and gets EXACTLY the tag dev ran. Nothing is rebuilt. ----------
+  deploy-prod:
+    if: github.event_name == 'push'
+    needs: deploy-dev
+    uses: ./.github/workflows/terraform-env.yml
+    with:
+      env: prod
+      image_tag: ${{ github.sha }}
+      apply: true
